@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,13 +27,14 @@ var (
 )
 
 type taskRepo interface {
-	getTasks(ctx context.Context) []*Task
-	addTask(ctx context.Context, task *Task) error
-	assignUser(ctx context.Context, userID, taskID string) error
-	unassignUser(ctx context.Context, userID, taskID string) error
-	completeTask(ctx context.Context, taskID string) error
-	getUserTasks(ctx context.Context, userID string) error
-	getUserOwnTasks(ctx context.Context, userID string) error
+	UnassignTask(ctx context.Context, userID, taskID int64) (*Task, error)
+	GetTasks(ctx context.Context) []*Task
+	GetTaskByID(ctx context.Context, taskID int64) (*Task, error)
+	GetTasksByUserID(ctx context.Context, userID int64) ([]*Task, error)
+	DeleteTaskByID(ctx context.Context, taskID int64)
+	GetTasksByAsigneeID(ctx context.Context, asigneeID int64) ([]*Task, error)
+	AddTask(ctx context.Context, task *Task) error
+	AssignTask(ctx context.Context, userID int64, userName string, taskID int64) (*Task, error)
 }
 
 type Task struct {
@@ -44,44 +47,300 @@ type Task struct {
 }
 
 type TaskDB struct {
-	mp map[string][]*Task
+	mp map[int64]*Task
 	mu sync.RWMutex
 }
 
 func NewTaskDB() taskRepo {
 	return &TaskDB{
-		mp: make(map[string][]*Task),
+		mp: make(map[int64]*Task),
 		mu: sync.RWMutex{},
 	}
 }
 
-func (tdb *TaskDB) getTasks(ctx context.Context) []*Task {
+func (tdb *TaskDB) UnassignTask(ctx context.Context, userID, taskID int64) (*Task, error) {
+	tdb.mu.Lock()
+	defer tdb.mu.Unlock()
+
+	if task, ok := tdb.mp[taskID]; !ok {
+		return nil, fmt.Errorf("cant find element with such id")
+	} else {
+		task.AssigneeID = 0
+		task.AsssigneeName = ""
+
+		return task, nil
+	}
+}
+
+func (tdb *TaskDB) GetTasks(ctx context.Context) []*Task {
+	tdb.mu.RLock()
+	defer tdb.mu.RUnlock()
+
+	var tasks []*Task
+
+	for _, value := range tdb.mp {
+		tasks = append(tasks, value)
+	}
+
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].TaskID < tasks[j].TaskID })
+
+	return tasks
+}
+
+func (tdb *TaskDB) GetTaskByID(ctx context.Context, taskID int64) (*Task, error) {
+	tdb.mu.RLock()
+	defer tdb.mu.RUnlock()
+
+	task, ok := tdb.mp[taskID]
+	if !ok {
+		return nil, fmt.Errorf("cant find element with such id")
+	} else {
+		return task, nil
+	}
+}
+
+func (tdb *TaskDB) GetTasksByUserID(ctx context.Context, userID int64) ([]*Task, error) {
+	tdb.mu.RLock()
+	defer tdb.mu.RUnlock()
+
+	var tasks []*Task
+
+	for _, value := range tdb.mp {
+		if value.OwnerID == userID {
+			tasks = append(tasks, value)
+		}
+	}
+
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].TaskID < tasks[j].TaskID })
+
+	return tasks, nil
+}
+
+func (tdb *TaskDB) DeleteTaskByID(ctx context.Context, taskID int64) {
+	tdb.mu.Lock()
+	defer tdb.mu.Unlock()
+
+	delete(tdb.mp, taskID)
+}
+
+func (tdb *TaskDB) GetTasksByAsigneeID(ctx context.Context, asigneeID int64) ([]*Task, error) {
+	tdb.mu.RLock()
+	defer tdb.mu.RUnlock()
+
+	var tasks []*Task
+
+	for _, value := range tdb.mp {
+		if value.AssigneeID == asigneeID {
+			tasks = append(tasks, value)
+		}
+	}
+
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].TaskID < tasks[j].TaskID })
+
+	return tasks, nil
+}
+
+func (tdb *TaskDB) AddTask(ctx context.Context, task *Task) error {
+	tdb.mu.Lock()
+	defer tdb.mu.Unlock()
+
+	tdb.mp[task.TaskID] = task
+
 	return nil
 }
 
-func (tdb *TaskDB) addTask(ctx context.Context, task *Task) error {
-	log.Println(*task)
-	return nil
+func (tdb *TaskDB) AssignTask(ctx context.Context, userID int64, userName string, taskID int64) (*Task, error) {
+	tdb.mu.Lock()
+	defer tdb.mu.Unlock()
+
+	if task, ok := tdb.mp[taskID]; ok {
+		task.AssigneeID = userID
+		task.AsssigneeName = userName
+
+		return task, nil
+	} else {
+		return nil, fmt.Errorf("cant change assignee")
+	}
 }
 
-func (tdb *TaskDB) assignUser(ctx context.Context, userID, taskID string) error {
-	return nil
+type Usecase struct {
+	db taskRepo
 }
 
-func (tdb *TaskDB) unassignUser(ctx context.Context, userID, taskID string) error {
-	return nil
+func NewUsecase(db taskRepo) *Usecase {
+	return &Usecase{
+		db: db,
+	}
 }
 
-func (tdb *TaskDB) completeTask(ctx context.Context, taskID string) error {
-	return nil
+func (uc *Usecase) CreateTask(ctx context.Context, update tgbotapi.Update) string {
+	txt, _ := strings.CutPrefix(update.Message.Text, "/new ")
+	task := &Task{
+		TaskID:    TaskID.Add(1),
+		OwnerID:   update.Message.Chat.ID,
+		OwnerName: update.Message.From.UserName,
+		TaskInfo:  txt,
+	}
+	uc.db.AddTask(ctx, task)
+	return fmt.Sprintf("Задача \"%s\" создана, id=%d", task.TaskInfo, task.TaskID)
 }
 
-func (tdb *TaskDB) getUserTasks(ctx context.Context, userID string) error {
-	return nil
+func (uc *Usecase) AssignTask(ctx context.Context, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	txt, _ := strings.CutPrefix(update.Message.Text, "/assign_")
+	taskNum, err := strconv.Atoi(txt)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "wrong task ID"))
+		return
+	}
+
+	tBefore, err := uc.db.GetTaskByID(ctx, int64(taskNum))
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "sorry, error happend"))
+		return
+	}
+	prevAssigneeID := tBefore.AssigneeID
+	ownerID := tBefore.OwnerID
+
+	task, err := uc.db.AssignTask(ctx, update.Message.From.ID, update.Message.From.UserName, int64(taskNum))
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "sorry, error happend"))
+		return
+	}
+
+	bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Задача \"%s\" назначена на вас", task.TaskInfo)))
+
+	if prevAssigneeID != 0 && prevAssigneeID != update.Message.Chat.ID {
+		bot.Send(tgbotapi.NewMessage(prevAssigneeID, fmt.Sprintf("Задача \"%s\" назначена на @%s", task.TaskInfo, update.Message.From.UserName)))
+		return
+	}
+
+	if ownerID != update.Message.Chat.ID {
+		bot.Send(tgbotapi.NewMessage(ownerID, fmt.Sprintf("Задача \"%s\" назначена на @%s", task.TaskInfo, update.Message.From.UserName)))
+	}
 }
 
-func (tdb *TaskDB) getUserOwnTasks(ctx context.Context, userID string) error {
-	return nil
+func (uc *Usecase) UnassignTask(ctx context.Context, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	txt, _ := strings.CutPrefix(update.Message.Text, "/unassign_")
+	taskNum, err := strconv.Atoi(txt)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "wrong task ID"))
+		return
+	}
+
+	task, err := uc.db.GetTaskByID(ctx, int64(taskNum))
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "wrong task ID"))
+		return
+	}
+
+	if task.AssigneeID == update.Message.Chat.ID {
+		taskRes, err := uc.db.UnassignTask(ctx, update.Message.Chat.ID, int64(taskNum))
+		if err != nil {
+			bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "sorry, error happend"))
+		}
+
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Принято"))
+		bot.Send(tgbotapi.NewMessage(taskRes.OwnerID, fmt.Sprintf("Задача \"%s\" осталась без исполнителя", taskRes.TaskInfo)))
+		return
+	}
+
+	bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Задача не на вас"))
+}
+
+func (uc *Usecase) CompleteTask(ctx context.Context, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	txt, _ := strings.CutPrefix(update.Message.Text, "/resolve_")
+	taskNum, err := strconv.Atoi(txt)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "wrong task ID"))
+		return
+	}
+
+	task, err := uc.db.GetTaskByID(ctx, int64(taskNum))
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "sorry, error happend"))
+		return
+	}
+
+	taskInfo := task.TaskInfo
+	taskOwnerID := task.OwnerID
+
+	uc.db.DeleteTaskByID(ctx, int64(taskNum))
+
+	bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Задача \"%s\" выполнена", task.TaskInfo)))
+	bot.Send(tgbotapi.NewMessage(taskOwnerID, fmt.Sprintf("Задача \"%s\" выполнена @%s", taskInfo, update.Message.From.UserName)))
+}
+
+func (uc *Usecase) ListMyTask(ctx context.Context, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	tasks, err := uc.db.GetTasksByAsigneeID(ctx, update.Message.Chat.ID)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "sorry, error happend"))
+		return
+	}
+
+	if len(tasks) < 1 {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Пусто"))
+		return
+	}
+
+	var b strings.Builder
+	for i, t := range tasks {
+		fmt.Fprintf(&b, "%d. %s by @%s\n/unassign_%d /resolve_%d",
+			t.TaskID, t.TaskInfo, t.OwnerName, t.TaskID, t.TaskID)
+		if i != len(tasks)-1 {
+			b.WriteString("\n")
+		}
+	}
+	bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, b.String()))
+}
+
+func (uc *Usecase) ListOwnTasks(ctx context.Context, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	tasks, err := uc.db.GetTasksByUserID(ctx, update.Message.Chat.ID)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "sorry, error happend"))
+		return
+	}
+
+	if len(tasks) < 1 {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Пусто"))
+		return
+	}
+
+	var b strings.Builder
+	for i, t := range tasks {
+		fmt.Fprintf(&b, "%d. %s by @%s\n/assign_%d",
+			t.TaskID, t.TaskInfo, t.OwnerName, t.TaskID)
+		if i != len(tasks)-1 {
+			b.WriteString("\n")
+		}
+	}
+	bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, b.String()))
+}
+
+func (uc *Usecase) ListAllTasks(ctx context.Context, bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	tasks := uc.db.GetTasks(ctx)
+
+	if len(tasks) < 1 {
+		bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Нет задач"))
+		return
+	}
+
+	var tasksStr strings.Builder
+
+	for it := 0; it < len(tasks); it++ {
+		switch tasks[it].AssigneeID {
+		case update.Message.From.ID:
+			tasksStr.WriteString(fmt.Sprintf("%d. %s by @%s\nassignee: я\n/unassign_%d /resolve_%d", tasks[it].TaskID, tasks[it].TaskInfo, tasks[it].OwnerName, tasks[it].TaskID, tasks[it].TaskID))
+		case 0:
+			tasksStr.WriteString(fmt.Sprintf("%d. %s by @%s\n/assign_%d", tasks[it].TaskID, tasks[it].TaskInfo, tasks[it].OwnerName, tasks[it].TaskID))
+		default:
+			tasksStr.WriteString(fmt.Sprintf("%d. %s by @%s\nassignee: @%s", tasks[it].TaskID, tasks[it].TaskInfo, tasks[it].OwnerName, tasks[it].AsssigneeName))
+		}
+		if it+1 < len(tasks) {
+			tasksStr.WriteString("\n\n")
+		}
+	}
+
+	bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, tasksStr.String()))
 }
 
 func startTaskBot(ctx context.Context) error {
@@ -95,6 +354,7 @@ func startTaskBot(ctx context.Context) error {
 	fmt.Printf("Authorized on account %s\n", bot.Self.UserName)
 
 	db := NewTaskDB()
+	uc := NewUsecase(db)
 
 	wh, err := tgbotapi.NewWebhook(WebhookURL)
 	if err != nil {
@@ -108,63 +368,36 @@ func startTaskBot(ctx context.Context) error {
 	updates := bot.ListenForWebhook("/")
 
 	go func() {
-		log.Fatalln("http err:", http.ListenAndServe(":80", nil))
+		log.Fatalln("http err:", http.ListenAndServe(":8081", nil))
 	}()
 	fmt.Println("start listen")
 
 	for update := range updates {
 		log.Printf("upd: %#v\n", update)
 
-		// usrID := update.Message.From.ID
-		// usrTag := update.Message.From.UserName
 		msg := update.Message.Text
 
 		if strings.HasPrefix(msg, "/new ") {
-			txt, _ := strings.CutPrefix(msg, "/new ")
-			db.addTask(ctx, &Task{
-				TaskID:    TaskID.Add(1),
-				OwnerID:   update.Message.From.ID,
-				OwnerName: update.Message.From.UserName,
-				TaskInfo:  txt,
-			})
+			bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, uc.CreateTask(ctx, update)))
 		} else if strings.HasPrefix(msg, "/assign_") {
-
+			uc.AssignTask(ctx, bot, update)
 		} else if strings.HasPrefix(msg, "/unassign_") {
-
+			uc.UnassignTask(ctx, bot, update)
 		} else if strings.HasPrefix(msg, "/resolve_") {
-
+			uc.CompleteTask(ctx, bot, update)
 		} else if strings.HasPrefix(msg, "/my") {
-
+			uc.ListMyTask(ctx, bot, update)
 		} else if strings.HasPrefix(msg, "/owner") {
-
+			uc.ListOwnTasks(ctx, bot, update)
+		} else if strings.HasPrefix(msg, "/tasks") {
+			uc.ListAllTasks(ctx, bot, update)
 		} else {
-
+			bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Unsupported command"))
 		}
-
-		// bot.Send(msg)
-		// continue
-
-		// bot.Send(tgbotapi.NewMessage(
-		// 	update.Message.Chat.ID,
-		// 	"sorry, error happend",
-		// ))
-
-		// bot.Send(tgbotapi.NewMessage(
-		// 	update.Message.Chat.ID,
-		// 	item.URL+"\n"+item.Title,
-		// ))
 	}
 
 	return nil
 }
-
-// * `/tasks` - выводит список всех активных задач
-// * `/new XXX YYY ZZZ` - создаёт новую задачу
-// * `/assign_$ID` - делает пользователя исполнителем задачи
-// * `/unassign_$ID` - снимает задачу с текущего исполнителя
-// * `/resolve_$ID` - выполняет задачу, удаляет её из списка
-// * `/my` - показывает задачи, которые назначены на меня
-// * `/owner` - показывает задачи, которые были созданы мной
 
 func main() {
 	err := startTaskBot(context.Background())
